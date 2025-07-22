@@ -1,214 +1,97 @@
-import numpy as np
-import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+# Importacion de librerias
+# %matplotlib inline
+
 import matplotlib.pyplot as plt
-from prettytable import PrettyTable
 import os
+import torch
+# from torch import nn
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+from torchvision.datasets import ImageFolder
+from PIL import Image
+from torch.nn import functional as Fun
+import torch.nn as nn
 
-os.environ["LOKY_MAX_CPU_COUNT"] = "11" 
+class RNC(nn.Module):
+  # Constructor
+  def __init__(self, input_size, num_classes):
+    super(RNC, self).__init__()
 
-# Funciones de activación para la capa oculta
-def gaussiana(r, varianza):
-    return np.exp(-r*2 / (2 * varianza*2))
+    self.conv1 = nn.Conv2d(in_channels=3, out_channels=224, kernel_size=3, stride=1, padding=1)
+    self.pool = nn.MaxPool2d(kernel_size=2)
+    self.conv2 = nn.Conv2d(in_channels=224, out_channels=224, kernel_size=3, stride=1, padding=1)
+    self.conv3 = nn.Conv2d(in_channels=224, out_channels=224, kernel_size=3, stride=1, padding=1)
+    # A drop layer deletes 20% of the features to help prevent overfitting
+    self.drop = nn.Dropout2d(p=0.2)
 
-def multicuadratica(r):
-    return np.sqrt(1 + r**2)
+    self.fc = nn.Linear(in_features=25*25*24, out_features=num_classes)
 
-def multicuadratica_inversa(r):
-    return 1 / np.sqrt(1 + r**2)
+  def forward(self, x):
+    x = Fun.relu(self.conv1(x))
+    # x = self.pool(x)
+    x = Fun.relu(self.conv2(x))
+    # x = self.pool(x)
+    x = Fun.relu(self.conv3(x))
 
-# Funciones de activación para la capa de salida
-def sigmoide(x):
-    return 1 / (1 + np.exp(-x))
+    x = Fun.dropout(x, training=self.training)
+    # Flatten
+    x = x.view(-1, 25*25*24)
+    # Feed to fully-connected layer to predict class
+    x = self.fc(x)
+    return Fun.log_softmax(x, dim=1)
 
-def softmax(x):
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum(axis=0)
+def train(model: RNC, device, train_loader, optimizer, epoch):
+  # Set model to training mode
+  model.train()
+  train_loss = 0
+  print("Epoch:", epoch)
 
-def tanh(x):
-    return np.tanh(x)
+  # Process the image in batches
+  for batch_idx, (data, target) in enumerate(train_loader):
+    # Move the data to the selected device
+    data, target = data.to(device), target.to(device)
 
-# Cálculo de la varianza
-def calcular_varianzas_por_centroide(centroides):
-    varianzas = []
-    for i, centroide in enumerate(centroides):
-        # Calcular distancias a otros centroides
-        distancias = [np.linalg.norm(centroide - otros) for j, otros in enumerate(centroides) if i != j]
-        # Ordenar distancias y calcular la media de las dos más cercanas
-        distancias.sort()
-        varianza = np.sqrt(distancias[0] * distancias[1])
-        varianzas.append(varianza)
-    return varianzas
+    # Reset the optimizer
+    optimizer.zero_grad()
 
-# Seleccionar las funciones de activación
-def seleccionar_Funciones_Activacion():
-    print("\nElige la función de activación para la capa oculta:")
-    print("     1. Gaussiana")
-    print("     2. Multicuadrática")
-    print("     3. Multicuadrática Inversa")
-    eleccion_oculta = input("Función de activación para la capa oculta: ")
+    # Push the data forward through the model layers
+    output = model(data)
 
-    if eleccion_oculta == "1":
-        funcion_oculta = gaussiana
-    elif eleccion_oculta == "2":
-        funcion_oculta = multicuadratica
-    elif eleccion_oculta == "3":
-        funcion_oculta = multicuadratica_inversa
-    else:
-        print("Selección inválida, usando Gaussiana por defecto.")
-        funcion_oculta = gaussiana
+    # Get the loss
+    loss = Fun.nll_loss(output, target)
 
-    print("\nElige la función de activación para la capa de salida:")
-    print("     1. Sigmoide")
-    print("     2. Softmax")
-    print("     3. Tangente Hiperbólica")
-    eleccion_salida = input("Función de activación para la capa de salida: ")
+    # Keep a running total
+    train_loss += loss.item()
 
-    if eleccion_salida == "1":
-        funcion_salida = sigmoide
-    elif eleccion_salida == "2":
-        funcion_salida = softmax
-    elif eleccion_salida == "3":
-        funcion_salida = tanh
-    else:
-        print("Selección inválida, usando Sigmoide por defecto.")
-        funcion_salida = sigmoide
+    # Backpropagate
+    loss.backward()
+    optimizer.step()
+    # train_loss += Fun.nll_loss(output, target, size_average=False).data.item()
 
-    return funcion_oculta, funcion_salida
+    # return average loss for epoch
+    avg_loss = train_loss / (batch_idx+1)
+  print('\nTrain set: Average loss: {:.6f}'.format(avg_loss))
+  return avg_loss
 
-# Función para cargar y preprocesar los datos
-def cargar_preprocesar_datos(df):
-    # Verificar si hay Id y extraer las entradas
-    inputs = np.array(df.iloc[:, 1:-1]) if df.columns[0] == "Id" else np.array(df.iloc[:, :-1])
-    
-    # Normalización de los inputs
-    escala = StandardScaler()
-    inputs = escala.fit_transform(inputs)
-    
-    # Mapear las clases
-    clases_esperadas = pd.factorize(df.iloc[:, -1])[0]
-    
-    # Codificación one-hot
-    num_clases = len(np.unique(clases_esperadas))
-    clases_esperadas_one_hot = np.eye(num_clases)[clases_esperadas]
-    
-    # Dividir en conjunto de entrenamiento y prueba
-    X_train, X_test, y_train, y_test = train_test_split(inputs, clases_esperadas_one_hot, test_size=0.2)
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-    return X_train, X_test, y_train, y_test
+# Define data transformations (if needed)
+data_transforms = transforms.Compose([
+    transforms.Resize((224, 224)), # Resize if necessary
+    transforms.ToTensor(),
+])
 
-# Función para aplicar la capa oculta RBF
-def capa_oculta_rbf(X, centroides, funcion_activacion, varianzas=None):
-    activaciones_ocultas = np.zeros((X.shape[0], len(centroides)))
+# Create datasets using ImageFolder
+train_dataset = datasets.ImageFolder(root='Cards/Train', transform=data_transforms)
+test_dataset = datasets.ImageFolder(root='Cards/Test', transform=data_transforms)
 
-    for i, centroide in enumerate(centroides):
-        # Calcular distancias entre los inputs y los centroides
-        distancias = np.linalg.norm(X - centroide, axis=1)
-        # Si la función es Gaussiana, usamos la varianza
-        if varianzas is not None and funcion_activacion == gaussiana:
-            activaciones_ocultas[:, i] = funcion_activacion(distancias, varianzas[i])
-        else:  # Para otras funciones que no requieran varianza
-            activaciones_ocultas[:, i] = funcion_activacion(distancias)
+# Create data loaders
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    return activaciones_ocultas
+modelo = RNC(input_size=224, num_classes=2)
+print(modelo)
 
-# Función para entrenar el modelo RBF
-def entrenar_rbf(X_train, y_train, centroides, funcion_oculta, funcion_salida, tasa_aprendizaje, epocas, varianzas):
-    
-    # Activaciones de la capa oculta
-    activaciones_ocultas = capa_oculta_rbf(X_train, centroides, funcion_oculta, varianzas)
-    
-    # Inicializar pesos aleatorios para la capa de salida
-    pesos_salida = np.random.randn(y_train.shape[1], activaciones_ocultas.shape[1])
-
-    # Lista de errores por época
-    errores_totales = [] 
-
-    # Entrenamiento
-    for epoca in range(epocas):
-        # Calcular salidas para las activaciones ocultas
-        salidas = funcion_salida(np.dot(pesos_salida, activaciones_ocultas.T)).T 
-        # Calcular el error
-        errores = salidas - y_train 
-        # Actualizar pesos (descenso del gradiente)
-        pesos_salida -= tasa_aprendizaje * np.dot(errores.T, activaciones_ocultas) 
-
-        # Calcular el error cuadrático medio para la época actual y almacenarlo
-        error_total = np.mean(np.square(errores))
-        errores_totales.append(error_total)
-
-    # Graficar el error total por época
-    plt.figure(figsize=(8, 6))
-    plt.plot(range(1, epocas + 1), errores_totales, linestyle='-')
-    plt.title('Error por Época')
-    plt.xlabel('Épocas')
-    plt.ylabel('Error Cuadrático Medio (MSE)')
-    plt.grid(True)
-    plt.show()
-
-    return pesos_salida
-
-# Función para evaluar el modelo RBF
-def evaluar_rbf(X_test, y_test, centroides, funcion_oculta, funcion_salida, pesos_salida, varianzas):
-    # Activaciones de la capa oculta
-    activaciones_ocultas = capa_oculta_rbf(X_test, centroides, funcion_oculta, varianzas)
-    clases_generadas = []
-
-    # Clasificación 
-    for i in range(X_test.shape[0]):
-        salida_oculta = activaciones_ocultas[i]
-        salida = funcion_salida(np.dot(pesos_salida, salida_oculta))
-        clases_generadas.append(np.argmax(salida))
-
-    # Precisión y Error Cuadrático Medio
-    precision = np.mean(np.argmax(y_test, axis=1) == clases_generadas)
-    mse = np.mean((y_test - np.eye(y_test.shape[1])[clases_generadas])**2)
-    
-    return precision, mse
-
-# Función main
-def main():
-    # Cargar y preprocesar los datos
-    dataset = input("Nombre del archivo CSV: ")
-    df = pd.read_csv(dataset)
-    X_train, X_test, y_train, y_test = cargar_preprocesar_datos(df)
-
-    # Pedir número de neuronas en la capa oculta
-    num_neuronas = int(input("\nNúmero de neuronas en la capa oculta (centroides): "))
-    
-    # Seleccionar funciones de activación
-    funcion_oculta, funcion_salida = seleccionar_Funciones_Activacion()
-
-    # Pedir tasa de aprendizaje y número de épocas
-    tasa_aprendizaje = float(input("\nTasa de Aprendizaje: "))
-    epocas = int(input("\nNúmero de Épocas: "))
-
-    # Crear los centroides usando KMeans
-    kmeans = KMeans(n_clusters=num_neuronas)
-    kmeans.fit(X_train)
-    centroides = kmeans.cluster_centers_
-
-    # Calcular las varianzas
-    varianzas = calcular_varianzas_por_centroide(centroides)
-
-    # Entrenar el modelo pasando las varianzas calculadas
-    pesos_salida = entrenar_rbf(X_train, y_train, centroides, funcion_oculta, funcion_salida, tasa_aprendizaje, epocas, varianzas)
-
-    # Evaluar el modelo pasando las varianzas calculadas
-    precision, mse = evaluar_rbf(X_test, y_test, centroides, funcion_oculta, funcion_salida, pesos_salida, varianzas)
-    
-    # Mostrar resultados
-    print(f"\nPrecisión: {precision * 100:.2f}%")
-    print(f"Error Cuadrático Medio: {mse:.4f}")
-    
-    # Mostrar tabla con clases esperadas y generadas
-    tabla = PrettyTable()
-    # tabla.field_names = ["Clases Esperadas", "Clases Generadas"]
-    # for i in range(len(y_test)):
-    #     tabla.add_row([np.argmax(y_test[i]), np.argmax(y_test[i])])
-    # print(tabla)
-
-if __name__ == "__main__":
-    main()
+avg_loss = train(modelo, 'cpu', train_loader, optim.Adam(modelo.parameters(), lr=0.001), 1)
